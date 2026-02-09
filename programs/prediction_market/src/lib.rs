@@ -14,12 +14,17 @@ pub const MARKET_SEED: &[u8] = b"market";
 pub const POOL_SEED: &[u8] = b"pool";
 pub const POSITION_SEED: &[u8] = b"position";
 pub const VAULT_SEED: &[u8] = b"vault";
+pub const LP_POSITION_SEED: &[u8] = b"lp_position";
 
 pub const BASIS_POINTS: u64 = 10000;
 pub const LP_FEE_BPS: u64 = 30; // 0.3% fee
 pub const MIN_LIQUIDITY: u64 = 1000; // Minimum initial liquidity
 pub const PRICE_DECIMALS: u64 = 1_000_000; // 6 decimal precision for prices
 pub const SHARE_DECIMALS: u64 = 1_000_000; // 6 decimal shares
+pub const MAX_TRADE_SIZE_BPS: u64 = 1000; // 10% of pool max per trade
+pub const RESOLUTION_DELAY: i64 = 300; // 5 minutes after expiration
+pub const MIN_SHARES_OUTPUT: u64 = 1000; // Minimum shares to prevent dust
+pub const MAX_ORACLE_STALENESS: i64 = 300; // 5 minutes max staleness
 
 // ============================================================================
 // Program
@@ -52,6 +57,18 @@ pub mod prediction_market {
         );
         require!(description.len() <= 128, MarketError::DescriptionTooLong);
 
+        // Validate Pyth oracle account
+        let price_feed = SolanaPriceAccount::account_info_to_feed(&ctx.accounts.pyth_price_account)
+            .map_err(|_| MarketError::InvalidOraclePrice)?;
+
+        // Verify oracle is publishing recent data
+        price_feed
+            .get_price_no_older_than(
+                Clock::get()?.unix_timestamp,
+                3600, // 1 hour max staleness for creation
+            )
+            .ok_or(MarketError::InvalidOraclePrice)?;
+
         let market = &mut ctx.accounts.market;
         market.authority = ctx.accounts.authority.key();
         market.market_id = market_id;
@@ -83,15 +100,7 @@ pub mod prediction_market {
             MarketError::InsufficientLiquidity
         );
 
-        let pool = &mut ctx.accounts.pool;
-        pool.market = ctx.accounts.market.key();
-        pool.yes_reserve = initial_liquidity;
-        pool.no_reserve = initial_liquidity;
-        pool.total_liquidity = initial_liquidity * 2;
-        pool.total_fees_collected = 0;
-        pool.bump = ctx.bumps.pool;
-
-        // Transfer SOL to vault
+        // Transfer SOL to vault first
         let cpi_context = CpiContext::new(
             ctx.accounts.system_program.to_account_info(),
             anchor_lang::system_program::Transfer {
@@ -101,20 +110,60 @@ pub mod prediction_market {
         );
         anchor_lang::system_program::transfer(cpi_context, initial_liquidity * 2)?;
 
+        // Initialize pool state
+        let pool = &mut ctx.accounts.pool;
+        pool.market = ctx.accounts.market.key();
+        pool.yes_reserve = initial_liquidity;
+        pool.no_reserve = initial_liquidity;
+        pool.total_liquidity = initial_liquidity * 2;
+        pool.total_fees_collected = 0;
+        pool.lp_token_supply = initial_liquidity * 2; // Initial LP tokens = liquidity amount
+        pool.bump = ctx.bumps.pool;
+
+        // Create LP position for initial provider
+        let lp_position = &mut ctx.accounts.lp_position;
+        lp_position.user = ctx.accounts.authority.key();
+        lp_position.pool = ctx.accounts.pool.key();
+        lp_position.lp_tokens = initial_liquidity * 2;
+        lp_position.bump = ctx.bumps.lp_position;
+
         msg!(
-            "Pool initialized with {} lamports liquidity",
+            "Pool initialized with {} lamports liquidity, {} LP tokens minted",
+            initial_liquidity * 2,
             initial_liquidity * 2
         );
         Ok(())
     }
 
     /// Add liquidity to the pool
-    pub fn add_liquidity(ctx: Context<ModifyLiquidity>, amount: u64) -> Result<()> {
+    pub fn add_liquidity(
+        ctx: Context<ModifyLiquidity>,
+        amount: u64,
+        min_lp_tokens: u64,
+    ) -> Result<()> {
         require!(
             ctx.accounts.market.status == MarketStatus::Active,
             MarketError::MarketNotActive
         );
         require!(amount > 0, MarketError::InvalidAmount);
+
+        let pool = &mut ctx.accounts.pool;
+        let total_liquidity = pool.total_liquidity;
+        let total_lp_shares = pool.lp_token_supply;
+
+        // Calculate LP tokens to mint
+        // lp_tokens = amount * total_lp_shares / total_liquidity
+        // Since we enforce 50/50 added value, we can just use total liquidity
+        let lp_tokens_to_mint = if total_liquidity == 0 {
+            amount
+        } else {
+            (amount as u128 * total_lp_shares as u128 / total_liquidity as u128) as u64
+        };
+
+        require!(
+            lp_tokens_to_mint >= min_lp_tokens,
+            MarketError::SlippageExceeded
+        );
 
         // Transfer SOL to vault
         let cpi_context = CpiContext::new(
@@ -127,38 +176,95 @@ pub mod prediction_market {
         anchor_lang::system_program::transfer(cpi_context, amount)?;
 
         // Update pool state - split 50/50
-        let pool = &mut ctx.accounts.pool;
         let half_amount = amount / 2;
         pool.yes_reserve += half_amount;
         pool.no_reserve += amount - half_amount;
         pool.total_liquidity += amount;
+        pool.lp_token_supply += lp_tokens_to_mint;
 
-        msg!("Added {} lamports liquidity", amount);
+        // Update user position
+        let lp_position = &mut ctx.accounts.lp_position;
+        lp_position.lp_tokens += lp_tokens_to_mint;
+        if lp_position.user == Pubkey::default() {
+            lp_position.user = ctx.accounts.user.key();
+            lp_position.pool = pool.key();
+            lp_position.bump = ctx.bumps.lp_position;
+        }
+
+        msg!(
+            "Added {} lamports liquidity, minted {} LP tokens",
+            amount,
+            lp_tokens_to_mint
+        );
         Ok(())
     }
 
     /// Remove liquidity from the pool
-    pub fn remove_liquidity(ctx: Context<ModifyLiquidity>, amount: u64) -> Result<()> {
-        require!(amount > 0, MarketError::InvalidAmount);
+    pub fn remove_liquidity(
+        ctx: Context<ModifyLiquidity>,
+        lp_tokens: u64,
+        min_amount_out: u64,
+    ) -> Result<()> {
+        require!(lp_tokens > 0, MarketError::InvalidAmount);
 
-        let pool = &ctx.accounts.pool;
+        let lp_position = &mut ctx.accounts.lp_position;
         require!(
-            amount <= pool.total_liquidity,
-            MarketError::InsufficientLiquidity
+            lp_position.lp_tokens >= lp_tokens,
+            MarketError::InsufficientShares
+        );
+
+        let pool = &mut ctx.accounts.pool;
+        let total_liquidity = pool.total_liquidity;
+        let total_lp_shares = pool.lp_token_supply;
+
+        require!(total_lp_shares > 0, MarketError::InsufficientLiquidity);
+
+        // Calculate amount to return
+        // amount = lp_tokens * total_liquidity / total_lp_shares
+        let amount_out =
+            (lp_tokens as u128 * total_liquidity as u128 / total_lp_shares as u128) as u64;
+
+        require!(amount_out >= min_amount_out, MarketError::SlippageExceeded);
+
+        // Check vault balance
+        let vault_lamports = ctx.accounts.vault.lamports();
+        require!(
+            vault_lamports >= amount_out,
+            MarketError::InsufficientVaultFunds
         );
 
         // Transfer SOL from vault to user
-        **ctx.accounts.vault.try_borrow_mut_lamports()? -= amount;
-        **ctx.accounts.user.try_borrow_mut_lamports()? += amount;
+        let bump = ctx.bumps.vault;
+        let bump_slice = &[bump];
+        let market_key = ctx.accounts.market.key();
+        let seeds = &[VAULT_SEED, market_key.as_ref(), bump_slice];
+        let signer_seeds = &[&seeds[..]];
+
+        let cpi_context = CpiContext::new_with_signer(
+            ctx.accounts.system_program.to_account_info(),
+            anchor_lang::system_program::Transfer {
+                from: ctx.accounts.vault.to_account_info(),
+                to: ctx.accounts.user.to_account_info(),
+            },
+            signer_seeds,
+        );
+        anchor_lang::system_program::transfer(cpi_context, amount_out)?;
 
         // Update pool state
-        let pool = &mut ctx.accounts.pool;
-        let half_amount = amount / 2;
+        let half_amount = amount_out / 2;
         pool.yes_reserve = pool.yes_reserve.saturating_sub(half_amount);
-        pool.no_reserve = pool.no_reserve.saturating_sub(amount - half_amount);
-        pool.total_liquidity = pool.total_liquidity.saturating_sub(amount);
+        pool.no_reserve = pool.no_reserve.saturating_sub(amount_out - half_amount);
+        pool.total_liquidity = pool.total_liquidity.saturating_sub(amount_out);
+        pool.lp_token_supply = pool.lp_token_supply.saturating_sub(lp_tokens);
 
-        msg!("Removed {} lamports liquidity", amount);
+        // Update user position
+        lp_position.lp_tokens -= lp_tokens;
+
+        msg!(
+            "Removed liquidity: burned {} LP tokens for {} lamports",
+            lp_tokens,
+            amount_out
+        );
         Ok(())
     }
 
@@ -176,7 +282,17 @@ pub mod prediction_market {
         );
         require!(amount_in > 0, MarketError::InvalidAmount);
 
-        let pool = &ctx.accounts.pool;
+        let pool = &mut ctx.accounts.pool;
+
+        // Check for max trade size (10% of total liquidity)
+        require!(
+            amount_in <= pool.total_liquidity * MAX_TRADE_SIZE_BPS / BASIS_POINTS,
+            MarketError::TradeExceedsMaxSize
+        );
+        require!(
+            pool.yes_reserve > 0 && pool.no_reserve > 0,
+            MarketError::PoolNotInitialized
+        );
 
         // Calculate fee
         let fee = amount_in * LP_FEE_BPS / BASIS_POINTS;
@@ -195,6 +311,7 @@ pub mod prediction_market {
         let shares_out = reserve_out.saturating_sub(new_reserve_out);
 
         require!(shares_out >= min_shares_out, MarketError::SlippageExceeded);
+        require!(shares_out >= MIN_SHARES_OUTPUT, MarketError::OutputTooSmall);
 
         // Transfer SOL to vault
         let cpi_context = CpiContext::new(
@@ -207,7 +324,11 @@ pub mod prediction_market {
         anchor_lang::system_program::transfer(cpi_context, amount_in)?;
 
         // Update pool state
-        let pool = &mut ctx.accounts.pool;
+        // Add fee is effectively added to the pool by not being in reserves math
+        // but we should track it for stats
+        pool.total_fees_collected += fee;
+
+        // Update reserves
         match side {
             Outcome::Yes => {
                 pool.no_reserve = new_reserve_in;
@@ -218,7 +339,6 @@ pub mod prediction_market {
                 pool.no_reserve = new_reserve_out;
             }
         }
-        pool.total_fees_collected += fee;
 
         // Update market totals
         let market = &mut ctx.accounts.market;
@@ -295,7 +415,12 @@ pub mod prediction_market {
             ),
         }
 
-        let pool = &ctx.accounts.pool;
+        let pool = &mut ctx.accounts.pool;
+
+        require!(
+            pool.yes_reserve > 0 && pool.no_reserve > 0,
+            MarketError::PoolNotInitialized
+        );
 
         // Calculate output using constant product formula
         let (reserve_in, reserve_out) = match side {
@@ -312,10 +437,31 @@ pub mod prediction_market {
         let amount_out = amount_out_before_fee - fee;
 
         require!(amount_out >= min_amount_out, MarketError::SlippageExceeded);
+        require!(amount_out >= MIN_SHARES_OUTPUT, MarketError::OutputTooSmall);
+
+        // Check vault balance
+        let vault_lamports = ctx.accounts.vault.lamports();
+        require!(
+            vault_lamports >= amount_out,
+            MarketError::InsufficientVaultFunds
+        );
 
         // Transfer SOL from vault to user
-        **ctx.accounts.vault.try_borrow_mut_lamports()? -= amount_out;
-        **ctx.accounts.user.try_borrow_mut_lamports()? += amount_out;
+        let bump = ctx.bumps.vault;
+        let bump_slice = &[bump];
+        let market_key = ctx.accounts.market.key();
+        let seeds = &[VAULT_SEED, market_key.as_ref(), bump_slice];
+        let signer_seeds = &[&seeds[..]];
+
+        let cpi_context = CpiContext::new_with_signer(
+            ctx.accounts.system_program.to_account_info(),
+            anchor_lang::system_program::Transfer {
+                from: ctx.accounts.vault.to_account_info(),
+                to: ctx.accounts.user.to_account_info(),
+            },
+            signer_seeds,
+        );
+        anchor_lang::system_program::transfer(cpi_context, amount_out)?;
 
         // Update pool state
         let pool = &mut ctx.accounts.pool;
@@ -367,7 +513,7 @@ pub mod prediction_market {
             MarketError::MarketNotActive
         );
         require!(
-            Clock::get()?.unix_timestamp >= market.expiration,
+            Clock::get()?.unix_timestamp >= market.expiration + RESOLUTION_DELAY,
             MarketError::MarketNotExpired
         );
 
@@ -440,9 +586,29 @@ pub mod prediction_market {
         // Each winning share is worth 1 unit of collateral (1 lamport per share unit)
         let payout = winning_shares;
 
+        // Check vault balance
+        let vault_lamports = ctx.accounts.vault.lamports();
+        require!(
+            vault_lamports >= payout,
+            MarketError::InsufficientVaultFunds
+        );
+
         // Transfer winnings from vault
-        **ctx.accounts.vault.try_borrow_mut_lamports()? -= payout;
-        **ctx.accounts.user.try_borrow_mut_lamports()? += payout;
+        let bump = ctx.bumps.vault;
+        let bump_slice = &[bump];
+        let market_key = ctx.accounts.market.key();
+        let seeds = &[VAULT_SEED, market_key.as_ref(), bump_slice];
+        let signer_seeds = &[&seeds[..]];
+
+        let cpi_context = CpiContext::new_with_signer(
+            ctx.accounts.system_program.to_account_info(),
+            anchor_lang::system_program::Transfer {
+                from: ctx.accounts.vault.to_account_info(),
+                to: ctx.accounts.user.to_account_info(),
+            },
+            signer_seeds,
+        );
+        anchor_lang::system_program::transfer(cpi_context, payout)?;
 
         // Mark position as claimed
         let position = &mut ctx.accounts.position;
@@ -453,6 +619,23 @@ pub mod prediction_market {
             payout,
             winning_shares
         );
+        Ok(())
+    }
+
+    /// Cancel a market that has not been resolved
+    pub fn cancel_market(ctx: Context<CancelMarket>) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        require!(
+            market.status == MarketStatus::Active,
+            MarketError::MarketNotActive
+        );
+        require!(
+            market.authority == ctx.accounts.authority.key(),
+            MarketError::Unauthorized
+        );
+
+        market.status = MarketStatus::Cancelled;
+        msg!("Market cancelled by authority");
         Ok(())
     }
 
@@ -581,6 +764,15 @@ pub struct InitializePool<'info> {
     )]
     pub vault: AccountInfo<'info>,
 
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + LPPosition::INIT_SPACE,
+        seeds = [LP_POSITION_SEED, pool.key().as_ref(), authority.key().as_ref()],
+        bump
+    )]
+    pub lp_position: Account<'info, LPPosition>,
+
     #[account(mut)]
     pub authority: Signer<'info>,
 
@@ -598,6 +790,15 @@ pub struct ModifyLiquidity<'info> {
     /// CHECK: Vault PDA
     #[account(mut, seeds = [VAULT_SEED, market.key().as_ref()], bump)]
     pub vault: AccountInfo<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = user,
+        space = 8 + LPPosition::INIT_SPACE,
+        seeds = [LP_POSITION_SEED, pool.key().as_ref(), user.key().as_ref()],
+        bump
+    )]
+    pub lp_position: Account<'info, LPPosition>,
 
     #[account(mut)]
     pub user: Signer<'info>,
@@ -661,6 +862,15 @@ pub struct ClaimWinnings<'info> {
     pub user: Signer<'info>,
 
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CancelMarket<'info> {
+    #[account(mut)]
+    pub market: Account<'info, Market>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
 }
 
 #[delegate]
@@ -740,6 +950,21 @@ pub struct Pool {
     pub total_liquidity: u64,
     /// Cumulative fees collected
     pub total_fees_collected: u64,
+    /// Total LP tokens minted
+    pub lp_token_supply: u64,
+    /// Bump seed
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct LPPosition {
+    /// Position owner
+    pub user: Pubkey,
+    /// Associated pool
+    pub pool: Pubkey,
+    /// LP tokens owned
+    pub lp_tokens: u64,
     /// Bump seed
     pub bump: u8,
 }
@@ -816,4 +1041,16 @@ pub enum MarketError {
     InsufficientShares,
     #[msg("Already claimed winnings")]
     AlreadyClaimed,
+    #[msg("Insufficient vault funds")]
+    InsufficientVaultFunds,
+    #[msg("Pool not initialized")]
+    PoolNotInitialized,
+    #[msg("Trade exceeds maximum size")]
+    TradeExceedsMaxSize,
+    #[msg("Unauthorized access")]
+    Unauthorized,
+    #[msg("Market cannot be cancelled")]
+    MarketCannotBeCancelled,
+    #[msg("Output amount too small")]
+    OutputTooSmall,
 }
